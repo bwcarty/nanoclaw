@@ -62,7 +62,7 @@ export async function run(args: string[]): Promise<void> {
     const emptyConfig = {
       allowedRoots: [],
       blockedPatterns: [],
-      nonMainReadOnly: true,
+      nonMainReadOnly: false,
     };
     fs.writeFileSync(configFile, JSON.stringify(emptyConfig, null, 2) + '\n');
   } else if (json) {
