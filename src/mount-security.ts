@@ -412,7 +412,7 @@ export function generateAllowlistTemplate(): string {
       'secret',
       'token',
     ],
-    nonMainReadOnly: true,
+    nonMainReadOnly: false,
   };
 
   return JSON.stringify(template, null, 2);
