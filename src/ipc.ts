@@ -27,6 +27,158 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
+// --- FORGE Gate Reply Handling (Spec 054) ---
+
+interface ParsedGateReply {
+  decision: 'approve' | 'reject' | 'query' | 'defer';
+  displayCode: string;
+  reason?: string;
+  queryType?: string;
+}
+
+/**
+ * Parse a text message for FORGE gate reply patterns.
+ * Patterns:
+ *   approve XXXX
+ *   reject XXXX reason text
+ *   show diff|tests|coverage|log|spec
+ *   defer
+ */
+export function parseGateReply(text: string): ParsedGateReply | null {
+  const trimmed = text.trim();
+
+  // approve XXXX
+  const approveMatch = trimmed.match(/^approve\s+([A-Za-z0-9]{4})\s*$/i);
+  if (approveMatch) {
+    return {
+      decision: 'approve',
+      displayCode: approveMatch[1].toUpperCase(),
+    };
+  }
+
+  // reject XXXX reason text
+  const rejectMatch = trimmed.match(/^reject\s+([A-Za-z0-9]{4})\s+(.+)$/is);
+  if (rejectMatch) {
+    return {
+      decision: 'reject',
+      displayCode: rejectMatch[1].toUpperCase(),
+      reason: rejectMatch[2].trim(),
+    };
+  }
+
+  // show diff|tests|coverage|log|spec
+  const showMatch = trimmed.match(
+    /^show\s+(diff|tests|coverage|log|spec)\s*$/i,
+  );
+  if (showMatch) {
+    return {
+      decision: 'query',
+      displayCode: '', // show doesn't need a display code
+      queryType: showMatch[1].toLowerCase(),
+    };
+  }
+
+  // defer
+  if (/^defer\s*$/i.test(trimmed)) {
+    return {
+      decision: 'defer',
+      displayCode: '',
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Find gate metadata matching a challenge display code.
+ * Searches gate-meta directory for pending gates.
+ */
+export function resolveGateByDisplayCode(
+  groupFolder: string,
+  displayCode: string,
+): { challengeNonce: string; gateId: string; specId: string } | null {
+  const metaDir = path.join(DATA_DIR, 'ipc', groupFolder, 'gate-meta');
+  if (!fs.existsSync(metaDir)) return null;
+
+  try {
+    const files = fs.readdirSync(metaDir).filter((f) => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const data = JSON.parse(
+          fs.readFileSync(path.join(metaDir, file), 'utf-8'),
+        );
+        if (
+          data.challenge_display &&
+          data.challenge_display.toUpperCase() === displayCode.toUpperCase()
+        ) {
+          return {
+            challengeNonce: data.challenge_nonce,
+            gateId: data.gate_id,
+            specId: data.spec_id,
+          };
+        }
+      } catch {
+        // skip malformed files
+      }
+    }
+  } catch {
+    // directory read error
+  }
+  return null;
+}
+
+/**
+ * Write a gate response file for FORGE adapter to poll.
+ * Also cleans up the gate-meta file after writing.
+ */
+export function writeGateResponse(
+  groupFolder: string,
+  challengeNonce: string,
+  response: {
+    decision: string;
+    gateId: string;
+    reason?: string;
+    queryType?: string;
+  },
+): void {
+  const responsesDir = path.join(DATA_DIR, 'ipc', groupFolder, 'responses');
+  fs.mkdirSync(responsesDir, { recursive: true, mode: 0o700 });
+
+  const responseJson = {
+    schema_version: '1.0.0',
+    gate_id: response.gateId,
+    decision: response.decision,
+    challenge_nonce: challengeNonce,
+    timestamp: new Date().toISOString(),
+    ...(response.reason ? { reason: response.reason } : {}),
+    ...(response.queryType ? { query_type: response.queryType } : {}),
+  };
+
+  const filepath = path.join(responsesDir, `forge-gate-${challengeNonce}.json`);
+  const tempPath = `${filepath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(responseJson, null, 2));
+  fs.renameSync(tempPath, filepath);
+
+  logger.info(
+    { gateId: response.gateId, decision: response.decision, groupFolder },
+    'FORGE gate response written to IPC',
+  );
+
+  // Clean up gate-meta file
+  const metaFile = path.join(
+    DATA_DIR,
+    'ipc',
+    groupFolder,
+    'gate-meta',
+    `forge-gate-${challengeNonce}.json`,
+  );
+  try {
+    if (fs.existsSync(metaFile)) fs.unlinkSync(metaFile);
+  } catch {
+    // non-critical
+  }
+}
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -35,7 +187,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
   ipcWatcherRunning = true;
 
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
-  fs.mkdirSync(ipcBaseDir, { recursive: true });
+  fs.mkdirSync(ipcBaseDir, { recursive: true, mode: 0o700 });
 
   const processIpcFiles = async () => {
     // Scan all group IPC directories (identity determined by directory)
